@@ -114,30 +114,37 @@ static void nms_sorted_bboxes(const std::vector<Object>& faceobjects, std::vecto
     }
 }
 
-static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_pred, int stride, const ncnn::Mat& in_pad, float prob_threshold, std::vector<Object>& objects)
-{
+// @brief:  generate proposals and filter bboxes
+// @param:  cls_pred[in]    row: num_grid * stride / max(in_pad.w, in_pad.h)
+// @param:  dis_pred[in]    row: num_grid * stride / max(in_pad.w, in_pad.h)
+// @param:  stride[in]  P3/8, P4/16, P5/32
+// @param:  in_pad[in]
+// @param:  prob_threshold[in]
+// @param:  objects[out]
+static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_pred,
+    int stride, const ncnn::Mat& in_pad, float prob_threshold, std::vector<Object>& objects) {
     const int num_grid = cls_pred.h;
 
     int num_grid_x;
     int num_grid_y;
-    if (in_pad.w > in_pad.h)
-    {
+    if (in_pad.w > in_pad.h) {
         num_grid_x = in_pad.w / stride;
         num_grid_y = num_grid / num_grid_x;
     }
-    else
-    {
+    else {
         num_grid_y = in_pad.h / stride;
         num_grid_x = num_grid / num_grid_y;
     }
+    printf("num_grid_x: %d, num_grid_y: %d\n", num_grid_x, num_grid_y);
+    printf("cls_pred.w: %d, cls_pred.h: %d\n", cls_pred.w, cls_pred.h);
+    printf("dis_pred.w: %d, dis_pred.h: %d\n", dis_pred.w, dis_pred.h);
 
     const int num_class = cls_pred.w;
     const int reg_max_1 = dis_pred.w / 4;
 
-    for (int i = 0; i < num_grid_y; i++)
-    {
-        for (int j = 0; j < num_grid_x; j++)
-        {
+    // from 1) up to down && 2) left to right
+    for (int i = 0; i < num_grid_y; i++) {
+        for (int j = 0; j < num_grid_x; j++) {
             const int idx = i * num_grid_x + j;
 
             const float* scores = cls_pred.row(idx);
@@ -145,17 +152,14 @@ static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_p
             // find label with max score
             int label = -1;
             float score = -FLT_MAX;
-            for (int k = 0; k < num_class; k++)
-            {
-                if (scores[k] > score)
-                {
+            for (int k = 0; k < num_class; k++) {
+                if (scores[k] > score) {
                     label = k;
                     score = scores[k];
                 }
             }
 
-            if (score >= prob_threshold)
-            {
+            if (score >= prob_threshold) {
                 ncnn::Mat bbox_pred(reg_max_1, 4, (void*)dis_pred.row(idx));
                 {
                     ncnn::Layer* softmax = ncnn::create_layer("Softmax");
@@ -179,25 +183,28 @@ static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_p
                 }
 
                 float pred_ltrb[4];
-                for (int k = 0; k < 4; k++)
-                {
+                for (int k = 0; k < 4; k++) {
                     float dis = 0.f;
+                    // distance after softmax
                     const float* dis_after_sm = bbox_pred.row(k);
-                    for (int l = 0; l < reg_max_1; l++)
-                    {
+                    // discrete distribution
+                    for (int l = 0; l < reg_max_1; l++) {
                         dis += l * dis_after_sm[l];
+                        printf("%2.6f ", dis_after_sm[l]);
                     }
+                    printf("\n");
 
                     pred_ltrb[k] = dis * stride;
                 }
 
+                // predict box center point
                 float pb_cx = (j + 0.5f) * stride;
                 float pb_cy = (i + 0.5f) * stride;
 
-                float x0 = pb_cx - pred_ltrb[0];
-                float y0 = pb_cy - pred_ltrb[1];
-                float x1 = pb_cx + pred_ltrb[2];
-                float y1 = pb_cy + pred_ltrb[3];
+                float x0 = pb_cx - pred_ltrb[0]; // left
+                float y0 = pb_cy - pred_ltrb[1]; // top
+                float x1 = pb_cx + pred_ltrb[2]; // right
+                float y1 = pb_cy + pred_ltrb[3]; // bottom
 
                 Object obj;
                 obj.rect.x = x0;
@@ -208,13 +215,18 @@ static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_p
                 obj.prob = score;
 
                 objects.push_back(obj);
+                printf("[%d][%d] stride: %d, label: %d, score: %.2f\n",
+                    i, j, stride, label, score);
+                printf("cls_pred(w,h): (%d, %d), dis_pred(w,h): (%d, %d)\n",
+                    cls_pred.w, cls_pred.h, dis_pred.w, dis_pred.h);
             }
         }
     }
 }
 
-static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
-{
+// @param:  bgr[in]
+// @param:  obj[out]
+static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects) {
     ncnn::Net nanodet;
 
     nanodet.opt.use_vulkan_compute = true;
@@ -227,35 +239,38 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
 
     int width = bgr.cols;
     int height = bgr.rows;
+    printf("load image width: %d, height: %d\n", width, height);
 
-    const int target_size = 320;
+    const int target_size = 320; // model input shape
     const float prob_threshold = 0.4f;
     const float nms_threshold = 0.5f;
 
-    // pad to multiple of 32
+    // pad to multiple of 32 (similar to letter box)
     int w = width;
     int h = height;
     float scale = 1.f;
-    if (w > h)
-    {
+    if (w > h) {
         scale = (float)target_size / w;
         w = target_size;
         h = h * scale;
     }
-    else
-    {
+    else {
         scale = (float)target_size / h;
         h = target_size;
         w = w * scale;
     }
 
+    // resize from (width, height) to (w, h)
     ncnn::Mat in = ncnn::Mat::from_pixels_resize(bgr.data, ncnn::Mat::PIXEL_BGR, width, height, w, h);
 
     // pad to target_size rectangle
     int wpad = (w + 31) / 32 * 32 - w;
     int hpad = (h + 31) / 32 * 32 - h;
     ncnn::Mat in_pad;
+    // make border for resized image(e.g. 320x240 -> 320x256),
+    // with (*pad/2, *pad - *pad/2) since wpad/hpad could be odd
     ncnn::copy_make_border(in, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, ncnn::BORDER_CONSTANT, 0.f);
+    printf("in pad: (%d, %d)\n", in_pad.w, in_pad.h);
 
     const float mean_vals[3] = {103.53f, 116.28f, 123.675f};
     const float norm_vals[3] = {0.017429f, 0.017507f, 0.017125f};
@@ -263,7 +278,7 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
 
     ncnn::Extractor ex = nanodet.create_extractor();
 
-    ex.input("input.1", in_pad);
+    ex.input("input.1", in_pad); // pixel bgr
 
     std::vector<Object> proposals;
 
@@ -316,8 +331,7 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
     int count = picked.size();
 
     objects.resize(count);
-    for (int i = 0; i < count; i++)
-    {
+    for (int i = 0; i < count; i++) {
         objects[i] = proposals[picked[i]];
 
         // adjust offset to original unpadded
@@ -341,7 +355,7 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
     return 0;
 }
 
-static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
+static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects, const char* out)
 {
     static const char* class_names[] = {
         "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
@@ -361,8 +375,8 @@ static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
     {
         const Object& obj = objects[i];
 
-        fprintf(stderr, "%d = %.5f at %.2f %.2f %.2f x %.2f\n", obj.label, obj.prob,
-                obj.rect.x, obj.rect.y, obj.rect.width, obj.rect.height);
+        fprintf(stderr, "%d = %.5f at (%6.2f, %6.2f) (%6.2f x %6.2f)\n",
+            obj.label, obj.prob, obj.rect.x, obj.rect.y, obj.rect.width, obj.rect.height);
 
         cv::rectangle(image, obj.rect, cv::Scalar(255, 0, 0));
 
@@ -386,19 +400,21 @@ static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
     }
 
-    cv::imshow("image", image);
-    cv::waitKey(0);
+    //cv::imshow("image", image);
+    //cv::waitKey(0);
+    cv::imwrite(out, image);
 }
 
 int main(int argc, char** argv)
 {
-    if (argc != 2)
+    if (argc < 2)
     {
-        fprintf(stderr, "Usage: %s [imagepath]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <imagepath> [output]\n", argv[0]);
         return -1;
     }
 
     const char* imagepath = argv[1];
+    const char* output = 2 < argc ? argv[2] : "nanodet.jpg";
 
     cv::Mat m = cv::imread(imagepath, 1);
     if (m.empty())
@@ -410,7 +426,7 @@ int main(int argc, char** argv)
     std::vector<Object> objects;
     detect_nanodet(m, objects);
 
-    draw_objects(m, objects);
+    draw_objects(m, objects, output);
 
     return 0;
 }
